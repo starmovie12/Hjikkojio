@@ -6,7 +6,7 @@ import {
   solveHubCloudNative,
   solveGadgetsWebNative,
 } from '@/lib/solvers';
-// v3 FIX: TIMER_API from config — NOT hardcoded (deleted line 25)
+// v3 FIX: TIMER_API from config — NOT hardcoded
 import {
   TIMER_API,
   TIMER_DOMAINS,
@@ -106,6 +106,10 @@ export async function POST(req: Request) {
   const links: any[]    = body?.links || [];
   const taskId: string  = body?.taskId;
   const extractedBy     = body?.extractedBy || 'Browser/Live';
+  
+  // RELAY RACE VARIABLES
+  const isRelay           = body?.isRelay === true;
+  const currentTimerIndex = body?.currentTimerIndex || 0;
 
   if (!links.length) {
     return new Response(JSON.stringify({ error: 'No links provided' }), { status: 400 });
@@ -114,8 +118,7 @@ export async function POST(req: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder    = new TextEncoder();
-      const overallStart = Date.now();
-
+      
       const send = (data: any) => {
         try {
           controller.enqueue(encoder.encode(JSON.stringify(data) + '\n'));
@@ -143,18 +146,18 @@ export async function POST(req: Request) {
             await db.runTransaction(async (tx: any) => {
               const snap = await tx.get(taskRef);
               if (!snap.exists) return;
-              const links = snap.data()!.links || [];
-              const idx = links.findIndex((l: any) => String(l.id) === String(lid));
+              const existingLinks = snap.data()!.links || [];
+              const idx = existingLinks.findIndex((l: any) => String(l.id) === String(lid));
               if (idx === -1) return;
-              links[idx] = {
-                ...links[idx],
+              existingLinks[idx] = {
+                ...existingLinks[idx],
                 status: 'done',
                 finalLink: cached.finalLink,
                 best_button_name: cached.best_button_name ?? null,
                 all_available_buttons: cached.all_available_buttons ?? [],
                 logs: [{ msg: '⚡ CACHE HIT', type: 'success' }],
               };
-              tx.update(taskRef, { links });
+              tx.update(taskRef, { links: existingLinks });
             });
             send({ id: lid, status: 'done', finalLink: cached.finalLink, best_button_name: cached.best_button_name });
             return;
@@ -185,7 +188,6 @@ export async function POST(req: Request) {
                 log(`❌ GadgetsWeb failed: ${r.message}`, 'error');
                 break;
               } else {
-                // v3 FIX: TIMER_API from config, suffix added here
                 log(`⏱ Timer bypass via VPS (loop ${loopCount + 1})`);
                 const r = await fetchJSON(`${TIMER_API}/solve?url=${encodeURIComponent(currentLink)}`, 20_000);
                 if (r.status === 'success' && r.extracted_link) { currentLink = r.extracted_link; loopCount++; continue; }
@@ -217,7 +219,7 @@ export async function POST(req: Request) {
               if (r.status === 'success') {
                 log(`✅ Done: ${r.best_download_link}`, 'success');
                 return {
-                  finalLink:             r.best_download_link,  // ← HubCloudNativeResult uses best_download_link
+                  finalLink:             r.best_download_link,
                   status:                'done',
                   best_button_name:      r.best_button_name      ?? null,
                   all_available_buttons: r.all_available_buttons ?? [],
@@ -255,7 +257,7 @@ export async function POST(req: Request) {
           best_button_name: resultPayload.best_button_name,
         });
 
-        // Save to Firestore
+        // Save ONLY the FINAL direct link to Firestore
         try {
           await saveToFirestore(taskId, lid, linkData, resultPayload, extractedBy);
         } catch { /* non-fatal */ }
@@ -274,25 +276,53 @@ export async function POST(req: Request) {
         send({ id: lid, status: 'finished' });
       };
 
-      // ─── Smart routing ──────────────────────────────────────────────────────
-      // v3 FIX: l.id — links.indexOf(l) REMOVED (old lines 232, 238)
-      const timerLinks  = links.filter(l => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
-      const directLinks = links.filter(l => !TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+      // ─── Smart Routing with Relay Race Logic ─────────────────────────────────
+      const timerLinks  = links.filter((l: any) => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+      const directLinks = links.filter((l: any) => !TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
 
-      // Direct links — parallel
-      const directPromises = directLinks.map((l: any) => processLink(l, l.id));
+      // RULE 1: Non-Timer APIs -> Execute Concurrently (Parallel)
+      // Only run direct links if this is the FIRST run (not a relay chain)
+      const directPromises = !isRelay ? directLinks.map((l: any) => processLink(l, l.id)) : [];
 
-      // Timer links — sequential (index-based — indexOf REMOVED)
+      // RULE 2: Timer Page API -> Execute STRICTLY SEQUENTIALLY using Relay Race
       const timerPromise = (async () => {
-        for (let i = 0; i < timerLinks.length; i++) {
-          const l = timerLinks[i];
-          if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) break;
-          await processLink(l, l.id); // l.id, not indexOf
+        if (timerLinks.length > 0 && currentTimerIndex < timerLinks.length) {
+          const currentTimerLink = timerLinks[currentTimerIndex];
+          
+          // Process EXACTLY ONE timer link per Vercel execution
+          await processLink(currentTimerLink, currentTimerLink.id);
+
+          // Check if there are more timer links left in the queue
+          if (currentTimerIndex + 1 < timerLinks.length) {
+            const nextIndex = currentTimerIndex + 1;
+            const targetUrl = `${new URL(req.url).origin}/api/stream_solve`;
+
+            // RELAY RACE TRIGGER: Fire the next link in the background & DO NOT await it.
+            // This instantly cuts the wire and gives the next link a fresh 60 seconds.
+            try {
+              fetch(targetUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  links: timerLinks,
+                  taskId,
+                  extractedBy,
+                  isRelay: true, 
+                  currentTimerIndex: nextIndex 
+                }),
+                keepalive: true // Helps ensure the request is sent even as the stream closes
+              }).catch(e => console.error('[Relay Race] Trigger error:', e));
+            } catch (err) {
+              console.error('[Relay Race] Fetch failed:', err);
+            }
+          }
         }
       })();
 
+      // Wait for the parallel non-timer links and the SINGLE timer link to finish
       await Promise.allSettled([...directPromises, timerPromise]);
 
+      // RULE 3: Cut the wire! Instantly close the stream and return 200 OK
       controller.close();
     },
   });
