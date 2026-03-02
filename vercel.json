@@ -1,0 +1,14 @@
+{
+  "functions": {
+    "app/api/cron/process-queue/route.ts": { "maxDuration": 60 },
+    "app/api/stream_solve/route.ts":       { "maxDuration": 60 },
+    "app/api/tasks/route.ts":              { "maxDuration": 60 },
+    "app/api/solve_task/route.ts":         { "maxDuration": 60 },
+    "app/api/ai/diagnose/route.ts":        { "maxDuration": 30 },
+    "app/api/ai/chat/route.ts":            { "maxDuration": 60 },
+    "app/api/ai/settings/route.ts":        { "maxDuration": 10 },
+    "app/api/admin/reset-stuck/route.ts":  { "maxDuration": 30 },
+    "app/api/admin/stats/route.ts":        { "maxDuration": 30 },
+    "app/api/tasks/bulk/route.ts":         { "maxDuration": 30 }
+  }
+}
