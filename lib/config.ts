@@ -5,7 +5,6 @@ export const HUBCLOUD_API  = `${VPS_BASE_URL}:${HUBCLOUD_PORT}`;
 export const TIMER_API     = `${VPS_BASE_URL}:${TIMER_PORT}`;
 
 // ─── Domain Lists ─────────────────────────────────────────────────────────────
-// Phase 4 FIX: Added missing domains found in production logs
 export const TIMER_DOMAINS = [
   'gadgetsweb', 'review-tech', 'ngwin', 'cryptoinsights',
   'techbigs', 'apkdone', 'linkvertise', 'shrinkme', 'shorte',
@@ -18,17 +17,16 @@ export const TARGET_DOMAINS = [
 ] as const;
 
 // ─── Timeout Configuration ────────────────────────────────────────────────────
-// PHASE 5 FIX: Increased from 20s→45s to utilize Vercel's full 60s limit.
-// VPS Timer APIs take 25-35s. 20s killed them prematurely.
-// 45s gives VPS ample time while leaving a 15s safety buffer before Vercel's 60s hard-kill.
-export const AXIOS_TIMEOUT_MS   = 45_000;
-export const LINK_TIMEOUT_MS    = 45_000;
-export const OVERALL_TIMEOUT_MS = 55_000;
+// STRICT 45s — 15s buffer before Vercel 60s hard-kill.
+// VPS Timer APIs take 25-35s, HubCloud VPS takes 15-30s — both fit in 45s.
+export const AXIOS_TIMEOUT_MS   = 45_000;  // Per-HTTP-request timeout
+export const LINK_TIMEOUT_MS    = 45_000;  // Per-link overall timeout (full chain)
+export const OVERALL_TIMEOUT_MS = 55_000;  // Overall invocation safety limit
 
 // ─── Relay Race Configuration (Phase 5) ──────────────────────────────────────
-// "Taar Kaatna" architecture: Each API call processes ONE timer link,
-// then triggers a fresh invocation for the next. This resets the Vercel 60s timer.
-export const RELAY_SAFETY_MARGIN_MS = 10_000; // 10s buffer before Vercel kills us — trigger relay early
+// Each API call processes ONE timer link → saves FINAL link → triggers relay for next.
+// Each relay gets a fresh 60s Vercel timer.
+export const RELAY_SAFETY_MARGIN_MS = 10_000; // Trigger relay 10s before timeout
 export const RELAY_MAX_CHAIN_DEPTH  = 10;     // Max relay hops to prevent infinite chains
 
 // ─── Retry Configuration (Phase 4) ───────────────────────────────────────────
