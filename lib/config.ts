@@ -18,10 +18,18 @@ export const TARGET_DOMAINS = [
 ] as const;
 
 // ─── Timeout Configuration ────────────────────────────────────────────────────
-// Phase 4 FIX: Reduced LINK_TIMEOUT from 25s→20s to fit 3 links in 60s budget
-export const AXIOS_TIMEOUT_MS   = 20_000;
-export const LINK_TIMEOUT_MS    = 20_000;
-export const OVERALL_TIMEOUT_MS = 50_000;
+// PHASE 5 FIX: Increased from 20s→45s to utilize Vercel's full 60s limit.
+// VPS Timer APIs take 25-35s. 20s killed them prematurely.
+// 45s gives VPS ample time while leaving a 15s safety buffer before Vercel's 60s hard-kill.
+export const AXIOS_TIMEOUT_MS   = 45_000;
+export const LINK_TIMEOUT_MS    = 45_000;
+export const OVERALL_TIMEOUT_MS = 55_000;
+
+// ─── Relay Race Configuration (Phase 5) ──────────────────────────────────────
+// "Taar Kaatna" architecture: Each API call processes ONE timer link,
+// then triggers a fresh invocation for the next. This resets the Vercel 60s timer.
+export const RELAY_SAFETY_MARGIN_MS = 10_000; // 10s buffer before Vercel kills us — trigger relay early
+export const RELAY_MAX_CHAIN_DEPTH  = 10;     // Max relay hops to prevent infinite chains
 
 // ─── Retry Configuration (Phase 4) ───────────────────────────────────────────
 export const MAX_RETRY_ATTEMPTS      = 2;
