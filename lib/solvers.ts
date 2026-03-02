@@ -25,7 +25,7 @@ import type {
 } from './types';
 
 // =============================================================================
-// PHASE 4: HTTP 522 RETRY WRAPPER
+// PHASE 4: HTTP 522 RETRY WRAPPER (RELAY RACE READY)
 // Cloudflare 522 = origin server not responding. Auto-retry with backoff.
 // =============================================================================
 
@@ -104,29 +104,10 @@ const EXTRACT_MOBILE_HEADERS: Record<string, string> = {
 
 // =============================================================================
 // FUNCTION 1: extractMovieLinks
-// ✅ FIX 1 APPLIED — Absolute URL resolution via new URL(rawLink, pageUrl).href
-//
-// ROOT CAUSE OF THE BUG:
-// The previous code took rawLink directly from href/data-href and added it to
-// foundLinks without ever checking if it was absolute. A relative URL like
-// "/go/hubcloud?id=abc123" contains the string "hubcloud", so it passed the
-// TARGET_DOMAINS_LIST check and was stored in the database. Phase 2 then called
-// axios.get("/go/hubcloud?id=abc123") which threw ERR_INVALID_URL and crashed.
-//
-// THE FIX:
-// Every raw link string is immediately resolved through new URL(rawLink, url).
-// This API handles all cases in one call:
-//   "https://hubcloud.foo/abc"   → unchanged (already absolute)
-//   "//hubcloud.foo/abc"         → adds https: (protocol-relative)
-//   "/go/hubcloud?id=xyz"        → adds page origin (root-relative)
-//   "../dl/hubcloud/xyz"         → resolves against page path (relative)
-//   "not a url %%"               → throws → we skip with continue
-// After this block, resolvedLink is always a valid fully-qualified absolute URL.
 // =============================================================================
 
 export async function extractMovieLinks(url: string): Promise<ExtractMovieLinksResult> {
   try {
-    // Phase 4 FIX: Use axiosWithRetry for 522 Cloudflare error auto-retry
     const response = await axiosWithRetry(url, {
       headers: EXTRACT_MOBILE_HEADERS as any,
       timeout: AXIOS_TIMEOUT_MS,
@@ -145,86 +126,51 @@ export async function extractMovieLinks(url: string): Promise<ExtractMovieLinksR
     const DOWNLOAD_KEYWORDS   = ['DOWNLOAD', '720P', '480P', '1080P', '4K', 'DIRECT', 'GDRIVE'];
     const TARGET_DOMAINS_LIST = ['hblinks', 'hubdrive', 'hubcdn', 'hubcloud', 'gdflix', 'drivehub'];
 
-    // -------------------------------------------------------------------------
-    // STEP 1: Collect all candidate elements.
-    // Scan (a) standard anchor tags inside content areas, AND
-    //      (b) elements with .btn or .button classes (styled download buttons).
-    // -------------------------------------------------------------------------
     const candidateElements: ReturnType<typeof $>[] = [];
 
-    // Standard anchors inside main content areas
     $('.entry-content a, main a, .post-content a').each((_i, el) => {
       candidateElements.push($(el));
     });
 
-    // Button class scan — catches styled download buttons (.btn, .button).
-    // Only processes non-anchor elements to avoid double-counting plain <a> tags.
     $('.entry-content .btn, .entry-content .button, main .btn, main .button, .post-content .btn, .post-content .button').each((_i, el) => {
       const tagName = (el as { tagName?: string }).tagName?.toLowerCase();
       if (tagName !== 'a') {
-        // For non-anchor button wrappers, prefer any nested anchor inside them
         const $innerA = $(el).find('a').first();
         if ($innerA.length > 0) {
           candidateElements.push($innerA);
         } else {
-          // No nested anchor — use the wrapper element itself (may carry data-href)
           candidateElements.push($(el));
         }
       }
     });
 
-    // -------------------------------------------------------------------------
-    // STEP 2: Process every collected candidate element
-    // -------------------------------------------------------------------------
     for (const $el of candidateElements) {
 
-      // STEP 2a: Extract raw link string from href, then fall back to data-href.
-      // Many movie sites encode the real URL in data-href to slow down scrapers.
       const hrefRaw     = ($el.attr('href')      || '').trim();
       const dataHrefRaw = ($el.attr('data-href') || '').trim();
       const rawLink     = hrefRaw || dataHrefRaw;
 
-      // Skip immediately if no link string exists at all
       if (!rawLink)                          continue;
-      // Skip in-page anchor links (e.g. "#comments")
       if (rawLink.startsWith('#'))           continue;
-      // Skip javascript: pseudo-links (e.g. "javascript:void(0)")
       if (rawLink.startsWith('javascript:')) continue;
 
-      // -----------------------------------------------------------------------
-      // STEP 2b: *** FIX 1 — MANDATORY ABSOLUTE URL RESOLUTION ***
-      // Resolve rawLink against the original page URL so it becomes absolute.
-      // If resolution throws (truly malformed string), skip this element.
-      // -----------------------------------------------------------------------
       let resolvedLink: string;
       try {
         resolvedLink = new URL(rawLink, url).href;
       } catch {
-        // rawLink cannot be resolved to any valid URL (mailto:, tel:, garbage).
-        // Skip silently — this is expected noise on every real page.
         continue;
       }
 
-      // STEP 2c: Junk domain check on the RESOLVED (absolute) URL.
-      // Always check the absolute URL, not rawLink, to avoid false positives.
       if (isJunkDomain(resolvedLink)) continue;
 
-      // STEP 2d: Get visible text content of the element
       const text = $el.text().trim();
 
-      // STEP 2e: Junk text check on raw anchor text
       if (isJunkLinkText(text)) continue;
 
-      // STEP 2f: Parent container junk text check.
-      // If the wrapping container is labeled as junk (e.g. "How to Download"),
-      // skip all buttons inside it.
       const $parentContainer = $el.closest('p, div, h3, h4, li');
       const parentText       = $parentContainer.text().trim();
       if (isJunkLinkText(parentText)) continue;
 
-      // STEP 2g: Domain + keyword relevance gate.
-      // A link must EITHER point to a known download CDN domain
-      // OR the visible button text must contain a known download keyword.
       const isTargetDomainLink = TARGET_DOMAINS_LIST.some((domain) =>
         resolvedLink.toLowerCase().includes(domain)
       );
@@ -234,39 +180,24 @@ export async function extractMovieLinks(url: string): Promise<ExtractMovieLinksR
 
       if (!isTargetDomainLink && !isDownloadKeywordText) continue;
 
-      // STEP 2h: Duplicate check on the RESOLVED URL.
-      // Using the resolved URL as the dedup key ensures the same destination
-      // reached via different relative/absolute forms is correctly deduplicated.
       if (seenUrls.has(resolvedLink)) continue;
       seenUrls.add(resolvedLink);
 
-      // -----------------------------------------------------------------------
-      // STEP 3: Build a clean human-readable display name for this link
-      // -----------------------------------------------------------------------
-
-      // Start with the raw visible text of the anchor
       let cleanName = text;
 
-      // STEP 3a: Full Unicode emoji removal — strip ALL emoji, not just a few.
       cleanName = cleanName
         .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
         .trim();
 
-      // STEP 3b: If name is still too short (<2 chars) after emoji removal,
-      // climb the DOM to find a descriptive heading label for this button group.
       if (!cleanName || cleanName.length < 2) {
         const $container   = $el.closest('p, div, h3, h4, li');
         const $prevHeading = $container.prev('h3, h4, h5, strong');
 
         if ($prevHeading.length > 0) {
-          // Sibling heading directly above describes this link group.
-          // Strip emojis from heading text too.
           cleanName = $prevHeading.text()
             .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
             .trim();
         } else {
-          // No sibling heading — use the container's own text (excluding children)
-          // to avoid pulling in all nested button texts.
           const containerOwnText = $container
             .clone()
             .children()
@@ -278,22 +209,14 @@ export async function extractMovieLinks(url: string): Promise<ExtractMovieLinksR
         }
       }
 
-      // STEP 3c: Truncate to maximum 50 characters
       cleanName = cleanName.substring(0, 50).trim();
 
-      // STEP 3d: FINAL junk check on the fully CLEANED name.
-      // Run again because emoji stripping and truncation may have exposed
-      // a bare junk word like "download" or "4k".
       if (isJunkLinkText(cleanName)) continue;
 
-      // Final fallback for empty or too-short name after all processing
       if (!cleanName || cleanName.length < 2) {
         cleanName = 'Download Link';
       }
 
-      // -----------------------------------------------------------------------
-      // STEP 4: All checks passed — push the RESOLVED absolute URL to results
-      // -----------------------------------------------------------------------
       foundLinks.push({ name: cleanName, link: resolvedLink });
     }
 
@@ -322,7 +245,6 @@ export async function extractMovieLinks(url: string): Promise<ExtractMovieLinksR
 
 // =============================================================================
 // FUNCTION 2: extractMoviePreview
-// (No changes — logic is correct as-is)
 // =============================================================================
 
 export function extractMoviePreview(html: string): MoviePreview {
@@ -358,22 +280,6 @@ export function extractMoviePreview(html: string): MoviePreview {
 
 // =============================================================================
 // FUNCTION 3: extractMovieMetadata
-// ✅ FIX 2 APPLIED — Wide sibling context label (replaces narrow closest() only)
-// ✅ FIX 3 APPLIED — Linked quality+format pair (atomic candidate, never mixed)
-//
-// FIX 2 ROOT CAUSE:
-// $(el).closest('h3,h4,p') only traverses UP through ancestors. The most common
-// real-world HTML pattern on HdHub4u/HdHub4u3 is:
-//   <h3>720p WEB-DL | Hindi + English</h3>  ← SIBLING — closest() MISSES THIS
-//   <p><a href="hubcloud.foo/abc">⚡ Download</a></p>
-// The <h3> is a sibling of <p>, not an ancestor. closest() returns the <p>
-// whose text is "⚡ Download" — zero metadata extracted from PASS 1.
-//
-// FIX 3 ROOT CAUSE:
-// resolution and format were updated as two INDEPENDENT variables. On a page
-// with "720p WEB-DL" + "1080p HDTC", resolution upgraded to 1080p (from HDTC
-// button) while format stayed WEB-DL (higher FORMAT_PRIORITY from 720p button).
-// Result: phantom "1080p WEB-DL" — a quality pair that never existed on the page.
 // =============================================================================
 
 export function extractMovieMetadata(html: string): MovieMetadata {
@@ -381,27 +287,13 @@ export function extractMovieMetadata(html: string): MovieMetadata {
 
   const foundLanguages = new Set<string>();
 
-  // ---------------------------------------------------------------------------
-  // FIX 3 — QUALITY CANDIDATE: Linked resolution + format as an atomic PAIR.
-  //
-  // We maintain a single bestCandidate object. Both resolution and format are
-  // ALWAYS from the same button label — never mixed from different buttons.
-  //
-  // Replacement rules (only one of these two conditions triggers a replace):
-  //   Condition A: new button resolution is strictly HIGHER than current best.
-  //   Condition B: new button resolution is EQUAL to current best AND
-  //                new button format has strictly HIGHER FORMAT_PRIORITY.
-  //
-  // Any other combination (lower res, or equal res + equal/lower format) → keep current.
-  // ---------------------------------------------------------------------------
   interface QualityCandidate {
-    resolution:      string; // e.g. "1080P", "720P", "4K", ""
-    resolutionScore: number; // numeric: 4K=2160, 1080p=1080, 720p=720, 0=none
-    format:          string; // e.g. "WEB-DL", "BluRay", ""
-    formatScore:     number; // FORMAT_PRIORITY value, -1 = no format on this button
+    resolution:      string; 
+    resolutionScore: number; 
+    format:          string; 
+    formatScore:     number; 
   }
 
-  // Empty zero-score starting point — any real button value will beat this.
   let bestCandidate: QualityCandidate = {
     resolution:      '',
     resolutionScore: 0,
@@ -409,15 +301,10 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     formatScore:     -1,
   };
 
-  // ---------------------------------------------------------------------------
-  // Content scope: main.page-body → div.entry-content → document root
-  // ---------------------------------------------------------------------------
   let $mainContent = $('main.page-body');
   if ($mainContent.length === 0) $mainContent = $('div.entry-content');
   if ($mainContent.length === 0) $mainContent = $.root() as ReturnType<typeof $>;
 
-  // Narrow scope to the DOWNLOAD LINKS section to avoid stray metadata from
-  // comments, sidebars, or unrelated parts of the page.
   let $downloadSection: ReturnType<typeof $> = $mainContent;
   $mainContent.find('h2, h3, h4').each((_i, heading) => {
     if ($(heading).text().toUpperCase().includes('DOWNLOAD LINKS')) {
@@ -426,11 +313,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // FORMAT PATTERN TABLE — used in PASS 1 and PASS 4 fallback.
-  // The loop that uses this table has NO break statement — every pattern is
-  // evaluated so the highest-priority format token on a single label wins.
-  // ---------------------------------------------------------------------------
   const FORMAT_PATTERNS: Array<[RegExp, string]> = [
     [/WEB-DL/i,           'WEB-DL'],
     [/BLURAY|BLU-RAY/i,   'BluRay'],
@@ -441,49 +323,22 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     [/10[- ]?Bit/i,       '10Bit'],
   ];
 
-  // ---------------------------------------------------------------------------
-  // PASS 1 — Extract from CDN download link button labels
-  //
-  // FIX 2 — WIDE SIBLING CONTEXT LABEL (4 text sources combined)
-  //
-  // Instead of closest('h3,h4,p') which only looks UP at ancestors,
-  // we build a contextLabel from four sources:
-  //
-  //   SOURCE 1: The anchor element's own visible text (e.g. "⚡ Download")
-  //   SOURCE 2: The anchor's direct parent element text (e.g. the <p> text)
-  //   SOURCE 3: Nearest preceding SIBLING heading of the direct parent
-  //             — this is the <h3>720p WEB-DL | Hindi</h3> that closest() missed
-  //   SOURCE 4: Nearest preceding SIBLING heading of the grandparent
-  //             — one more level of nesting depth for safety
-  //
-  // All four are joined into one contextLabel string. Regex word-boundary
-  // matching correctly finds tokens across join boundaries.
-  // ---------------------------------------------------------------------------
   $downloadSection.find('a[href]').each((_i, el) => {
     const href = ($(el).attr('href') || '').toLowerCase();
 
-    // Only process links pointing to known CDN download domains
     if (!CDN_DOMAINS.some((domain) => href.includes(domain))) return;
 
-    // SOURCE 1: Anchor's own visible text
     const anchorOwnText = $(el).text().trim();
-
-    // SOURCE 2: Direct parent element's full text
     const $directParent    = $(el).parent();
     const directParentText = $directParent.text().trim();
 
-    // SOURCE 3: Nearest preceding sibling heading of the direct parent.
-    // prevAll() returns all preceding siblings; .first() gives the closest one.
     const $siblingOfParent     = $directParent.prevAll('h2, h3, h4, strong').first();
     const siblingOfParentText  = $siblingOfParent.text().trim();
 
-    // SOURCE 4: Nearest preceding sibling heading of the grandparent.
-    // Handles one more level of nesting (e.g. <p> inside <div class="dl-block">).
     const $grandParent             = $directParent.parent();
     const $siblingOfGrandParent    = $grandParent.prevAll('h2, h3, h4, strong').first();
     const siblingOfGrandParentText = $siblingOfGrandParent.text().trim();
 
-    // Combine all four sources into one wide, searchable context string.
     const contextLabel = [
       anchorOwnText,
       directParentText,
@@ -497,16 +352,12 @@ export function extractMovieMetadata(html: string): MovieMetadata {
 
     if (!contextLabel) return;
 
-    // ── Language extraction — search contextLabel (not just direct parent) ───
     for (const lang of VALID_LANGUAGES) {
       if (new RegExp(`\\b${lang}\\b`, 'i').test(contextLabel)) {
         foundLanguages.add(lang);
       }
     }
 
-    // ── Quality candidate extraction — FIX 3 atomic pair logic ──────────────
-
-    // Compute resolution score for this button's contextLabel
     const resolutionMatch   = contextLabel.match(/(480p|720p|1080p|2160p|4K)/i);
     let thisResolution      = '';
     let thisResolutionScore = 0;
@@ -517,8 +368,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
         : parseInt(thisResolution.replace(/\D/g, '') || '0', 10);
     }
 
-    // Scan ALL format patterns in contextLabel — NO break.
-    // Keep the highest-priority format found within this single label.
     let thisFormat      = '';
     let thisFormatScore = -1;
     for (const [pattern, formatName] of FORMAT_PATTERNS) {
@@ -528,12 +377,9 @@ export function extractMovieMetadata(html: string): MovieMetadata {
           thisFormatScore = score;
           thisFormat      = formatName;
         }
-        // NO break — continue evaluating all remaining format patterns
       }
     }
 
-    // Apply atomic replacement logic — only update bestCandidate if this
-    // button is genuinely better, and ALWAYS update both fields together.
     if (thisResolutionScore > 0) {
       const shouldReplace =
         thisResolutionScore > bestCandidate.resolutionScore ||
@@ -553,10 +399,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // PASS 2 — MULTi tag pattern scan
-  // Handles: "MULTi [HINDI + ENGLISH + TAMIL]" multi-language release labels.
-  // ---------------------------------------------------------------------------
   const pageText   = $downloadSection.text();
   const multiMatch = pageText.match(/MULTi[\s\S]*?\[([\s\S]*?HINDI[\s\S]*?)\]/i);
   if (multiMatch && multiMatch[1]) {
@@ -567,11 +409,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // PASS 3 — Language field fallback
-  // Runs only if PASS 1 + PASS 2 found zero languages.
-  // Scans for an explicit "Language : Hindi, English" info field.
-  // ---------------------------------------------------------------------------
   if (foundLanguages.size === 0) {
     $mainContent.find('div, span, p').each((_i, elem) => {
       const elemText       = $(elem).text();
@@ -583,17 +420,11 @@ export function extractMovieMetadata(html: string): MovieMetadata {
             foundLanguages.add(lang);
           }
         }
-        return false; // Stop after the first "Language :" field
+        return false; 
       }
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // PASS 4 — Quality field fallback
-  // Runs only if PASS 1 found no resolution at all (bestCandidate.resolution is empty).
-  // Scans for an explicit "Quality : 1080p WEB-DL" info field.
-  // Uses the same atomic-pair logic as PASS 1 — both fields updated together.
-  // ---------------------------------------------------------------------------
   if (!bestCandidate.resolution) {
     $mainContent.find('div, span, p').each((_i, elem) => {
       const elemText = $(elem).text();
@@ -605,7 +436,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
 
       const fieldContent = qualityFieldMatch[1];
 
-      // Extract resolution from the Quality field
       const resInField        = fieldContent.match(/(480p|720p|1080p|2160p|4K)/i);
       let fallbackResolution      = '';
       let fallbackResolutionScore = 0;
@@ -616,7 +446,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
           : parseInt(fallbackResolution.replace(/\D/g, '') || '0', 10);
       }
 
-      // Scan ALL format patterns from the Quality field — NO break.
       let fallbackFormat      = '';
       let fallbackFormatScore = -1;
       for (const [pattern, formatName] of FORMAT_PATTERNS) {
@@ -626,11 +455,9 @@ export function extractMovieMetadata(html: string): MovieMetadata {
             fallbackFormatScore = score;
             fallbackFormat      = formatName;
           }
-          // NO break — check all patterns for highest priority
         }
       }
 
-      // Apply as atomic pair — both resolution and format from this one field
       if (fallbackResolutionScore > 0) {
         bestCandidate = {
           resolution:      fallbackResolution,
@@ -640,13 +467,10 @@ export function extractMovieMetadata(html: string): MovieMetadata {
         };
       }
 
-      return false; // Stop after the first "Quality :" field
+      return false; 
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Build final output values
-  // ---------------------------------------------------------------------------
   const langArray = Array.from(foundLanguages).sort();
   const langCount = langArray.length;
 
@@ -656,7 +480,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
     langCount === 2 ? 'Dual Audio' :
                       'Multi Audio';
 
-  // Both fields of qualityString always came from the same source (FIX 3 guarantee)
   const qualityString = bestCandidate.resolution
     ? `${bestCandidate.resolution}${bestCandidate.format ? ' ' + bestCandidate.format : ''}`.trim()
     : 'Unknown Quality';
@@ -670,7 +493,6 @@ export function extractMovieMetadata(html: string): MovieMetadata {
 
 // =============================================================================
 // FUNCTION 4: solveHBLinks
-// (No changes — logic is correct as-is)
 // =============================================================================
 
 export async function solveHBLinks(url: string): Promise<HBLinksResult> {
@@ -706,21 +528,6 @@ export async function solveHBLinks(url: string): Promise<HBLinksResult> {
 
 // =============================================================================
 // FUNCTION 5: solveHubCDN
-// ✅ FIX 4 APPLIED — Empty catch {} replaced with console.warn + full diagnostics
-//
-// ROOT CAUSE OF THE BUG:
-// The inner try/catch block around the Base64 decode logic had an empty catch {}.
-// When new URL(cleanUrl) threw (e.g. HubCDN changed their JS variable format),
-// the error was silently swallowed. targetUrl stayed === the original url, so
-// the second axios.get fetched the SAME original page again instead of the
-// decoded redirect target. The function returned { status: 'failed' } with no
-// indication the decode step had failed — making production debugging impossible.
-//
-// THE FIX:
-// Replace catch {} with catch (decodeError) that logs a structured console.warn
-// including the original URL, the raw matched string from the page, and the
-// error message. targetUrl still falls back to original (same runtime behavior)
-// but the failure is now fully visible in Vercel function logs.
 // =============================================================================
 
 export async function solveHubCDN(url: string): Promise<HubCDNResult> {
@@ -742,8 +549,6 @@ export async function solveHubCDN(url: string): Promise<HubCDNResult> {
             targetUrl = Buffer.from(rParam + '='.repeat(padding), 'base64').toString('utf-8');
           }
         } catch (decodeError: unknown) {
-          // Log structured warning — engineers can see exactly what the site
-          // returned and update parsing logic without needing to reproduce.
           console.warn(
             '[solveHubCDN] WARNING: Failed to decode reurl param — falling back to original URL.',
             {
@@ -752,8 +557,6 @@ export async function solveHubCDN(url: string): Promise<HubCDNResult> {
               decodeErrorMsg: decodeError instanceof Error ? decodeError.message : String(decodeError),
             }
           );
-          // targetUrl remains === url. The second axios.get below will still
-          // attempt a fetch; it may or may not find a#vd on the original page.
         }
       }
     }
@@ -777,7 +580,6 @@ export async function solveHubCDN(url: string): Promise<HubCDNResult> {
 
 // =============================================================================
 // FUNCTION 6: solveHubDrive
-// (No changes — logic is correct as-is)
 // =============================================================================
 
 export async function solveHubDrive(url: string): Promise<HubDriveResult> {
@@ -812,8 +614,7 @@ export async function solveHubDrive(url: string): Promise<HubDriveResult> {
 }
 
 // =============================================================================
-// FUNCTION 7: solveHubCloudNative
-// (No changes — logic is correct as-is)
+// FUNCTION 7: solveHubCloudNative (Ready for parallel execution)
 // =============================================================================
 
 export async function solveHubCloudNative(url: string): Promise<HubCloudNativeResult> {
@@ -842,8 +643,7 @@ export async function solveHubCloudNative(url: string): Promise<HubCloudNativeRe
 }
 
 // =============================================================================
-// FUNCTION 8: solveGadgetsWebNative
-// (No changes — logic is correct as-is)
+// FUNCTION 8: solveGadgetsWebNative (Ready for Sequential Timer Queue)
 // =============================================================================
 
 export async function solveGadgetsWebNative(url: string): Promise<GadgetsWebResult> {
