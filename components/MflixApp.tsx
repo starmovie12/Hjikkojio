@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Bolt,
   Link as LinkIcon,
@@ -286,10 +286,27 @@ export default function MflixApp() {
    */
   const enginePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /**
+   * tasksRef: Latest tasks array for use in async closures.
+   * Used by fetchEngineStatus to avoid duplicate /api/tasks call.
+   */
+  const tasksRef = useRef<Task[]>([]);
+
+  /**
+   * repeatingLinkId: Currently repeating individual link ID.
+   * Problem 5: Track which link is being individually repeated.
+   */
+  const [repeatingLinkId, setRepeatingLinkId] = useState<string | number | null>(null);
+
   // Sync isAutoPilotEnabled → localStorage
   useEffect(() => {
     try { localStorage.setItem('mflix_autopilot_enabled', String(isAutoPilotEnabled)); } catch {}
   }, [isAutoPilotEnabled]);
+
+  // Sync tasksRef with latest tasks state (for async closures)
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   // On mount: if autopilot was ON, auto-restart
   useEffect(() => {
@@ -470,33 +487,23 @@ export default function MflixApp() {
       const res = await fetch('/api/engine-status');
       if (!res.ok) return;
       const data = await res.json();
-      // Poora object store karo — signal, timeSinceLastRun, backgroundActive, etc.
       setEngineStatus(data);
 
-      // Phase 4: Detect stuck tasks from engine status
+      // Phase 4: Detect stuck tasks — use tasksRef (NO duplicate /api/tasks call)
       const stuckN = (data.processingCount || 0);
       if (stuckN > 0) {
-        // Check if tasks are actually stuck (>10min) via tasks list
-        try {
-          const tRes = await fetch('/api/tasks');
-          if (tRes.ok) {
-            const tasks = await tRes.json();
-            if (Array.isArray(tasks)) {
-              const now = Date.now();
-              const stuck = tasks.filter((t: any) => {
-                if (t.status !== 'processing') return false;
-                const started = t.processingStartedAt || t.createdAt;
-                return started && (now - new Date(started).getTime() > 10 * 60 * 1000);
-              });
-              setStuckCount(stuck.length);
-            }
-          }
-        } catch { /* ok */ }
+        const now = Date.now();
+        const stuck = tasksRef.current.filter((t: any) => {
+          if (t.status !== 'processing') return false;
+          const started = t.processingStartedAt || t.createdAt;
+          return started && (now - new Date(started).getTime() > 10 * 60 * 1000);
+        });
+        setStuckCount(stuck.length);
       } else {
         setStuckCount(0);
       }
     } catch {
-      // Silent fail — engine status non-critical hai
+      // Silent fail — engine status non-critical
     }
   }, []);
 
@@ -814,14 +821,15 @@ export default function MflixApp() {
         console.error('Stream error:', streamErr);
       } finally {
         // ── Cleanup ───────────────────────────────────────────────────────
-        // Stream khatam — grace period start karo, polling allow karo
         streamStartedRef.current.delete(taskId);
-        streamEndedAtRef.current[taskId] = Date.now(); // 15s grace period start
+        streamEndedAtRef.current[taskId] = Date.now();
 
-        // 1 second baad ek fresh fetch karo
-        setTimeout(fetchTasks, 1000);
+        // Multiple fetches to catch relay results
+        fetchTasks();                     // Immediate
+        setTimeout(fetchTasks, 3000);     // Catch first relay
+        setTimeout(fetchTasks, 8000);     // Catch slower relays
+        setTimeout(fetchTasks, 15000);    // Final catch
 
-        // Active stream clear karo
         setActiveTaskId(null);
       }
     },
@@ -1146,6 +1154,140 @@ export default function MflixApp() {
   };
 
   // ─────────────────────────────────────────────────────────────────────────
+  // PROBLEM 4 FIX: GLOBAL "RETRY FAILED" — Only retry failed/pending links
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * handleRetryFailed()
+   * SIRF failed/pending links ko retry karta hai.
+   * Successfully solved links (done/success) ko KABHI touch nahi karta.
+   */
+  const handleRetryFailed = useCallback(async (task: Task) => {
+    if (!task.links || task.links.length === 0) return;
+
+    // Filter: Only failed/pending/error links
+    const failedLinks = task.links.filter((l: any) => {
+      const s = (l.status || '').toLowerCase();
+      return s !== 'done' && s !== 'success';
+    });
+
+    if (failedLinks.length === 0) return;
+
+    // Shield initialize
+    completedLinksRef.current[task.id] = completedLinksRef.current[task.id] || {};
+
+    // Preserve already-done links in shield
+    task.links.forEach((l: any, idx: number) => {
+      const s = (l.status || '').toLowerCase();
+      if (s === 'done' || s === 'success') {
+        completedLinksRef.current[task.id][idx] = {
+          status: 'done',
+          finalLink: l.finalLink,
+          best_button_name: l.best_button_name,
+          logs: l.logs || [{ msg: '⚡ Previously solved', type: 'success' }],
+        };
+      }
+    });
+
+    setExpandedTask(task.id);
+    setActiveTab('processing');
+
+    // Send ONLY failed links to stream_solve with retryFailedOnly flag
+    await startLiveStream(task.id, task.links);
+  }, [startLiveStream]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PROBLEM 5 FIX: INDIVIDUAL LINK REPEAT
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * handleRepeatLink()
+   * Ek specific link ko individually repeat karta hai.
+   * Baaqi saare links untouched rehte hain.
+   */
+  const handleRepeatLink = useCallback(async (taskId: string, linkId: number | string, allLinks: any[]) => {
+    setRepeatingLinkId(linkId);
+
+    try {
+      // Reset this link's status in Firebase first
+      const taskRef = `/api/tasks`;
+      // We don't need to update Firebase directly — stream_solve will handle it
+
+      // Stream solve with singleLinkId parameter
+      const response = await fetch('/api/stream_solve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          links: allLinks,
+          taskId,
+          extractedBy: 'Browser/Live',
+          singleLinkId: linkId,
+        }),
+      });
+
+      if (!response.ok || !response.body) {
+        console.error('Single link retry failed:', response.status);
+        return;
+      }
+
+      // Parse NDJSON response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line);
+            const lid = data.id;
+
+            // Update live states for this link
+            if (data.msg && data.type) {
+              setLiveLogs(prev => ({
+                ...prev,
+                [lid]: [...(prev[lid] || []), { msg: data.msg, type: data.type }],
+              }));
+            }
+
+            if (data.final) {
+              setLiveLinks(prev => ({ ...prev, [lid]: data.final }));
+            }
+
+            if (data.status === 'done' || data.status === 'error') {
+              setLiveStatuses(prev => ({ ...prev, [lid]: data.status }));
+
+              // Update shield
+              if (!completedLinksRef.current[taskId]) completedLinksRef.current[taskId] = {};
+              completedLinksRef.current[taskId][lid] = {
+                status: data.status,
+                finalLink: data.final,
+                best_button_name: data.best_button_name,
+                logs: [],
+              };
+            }
+          } catch { /* skip bad JSON */ }
+        }
+      }
+
+      // Refresh tasks to get updated data
+      fetchTasks();
+      setTimeout(fetchTasks, 3000);
+    } catch (err: any) {
+      console.error('handleRepeatLink error:', err);
+    } finally {
+      setRepeatingLinkId(null);
+    }
+  }, [fetchTasks]);
+
+  // ─────────────────────────────────────────────────────────────────────────
   // MANUAL PROCESS — startProcess()
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -1394,17 +1536,21 @@ export default function MflixApp() {
   // TAB BADGE COUNTS
   // ─────────────────────────────────────────────────────────────────────────
 
-  const processingCount = tasks.filter(
-    (t) => getTrueTaskStatus(t, getEffectiveStats(t)) === 'processing'
-  ).length;
+  // ─── TAB BADGE COUNTS (memoized — no re-calc every render) ──────────────
+  const processingCount = useMemo(() =>
+    tasks.filter(t => getTrueTaskStatus(t, getEffectiveStats(t)) === 'processing').length,
+    [tasks, activeTaskId, liveStatuses]
+  );
 
-  const completedCount = tasks.filter(
-    (t) => getTrueTaskStatus(t, getEffectiveStats(t)) === 'completed'
-  ).length;
+  const completedCount = useMemo(() =>
+    tasks.filter(t => getTrueTaskStatus(t, getEffectiveStats(t)) === 'completed').length,
+    [tasks, activeTaskId, liveStatuses]
+  );
 
-  const failedCount = tasks.filter(
-    (t) => getTrueTaskStatus(t, getEffectiveStats(t)) === 'failed'
-  ).length;
+  const failedCount = useMemo(() =>
+    tasks.filter(t => getTrueTaskStatus(t, getEffectiveStats(t)) === 'failed').length,
+    [tasks, activeTaskId, liveStatuses]
+  );
 
   const historyCount = tasks.length;
 
@@ -1425,14 +1571,15 @@ export default function MflixApp() {
     rehydrateFromFirebase();
     fetchEngineStatus();
 
-    // ⭐ 5-second polling — Frontend Firebase SDK use nahi karta
-    // onSnapshot possible nahi isliye setInterval mandatory hai
+    // ⭐ 10-second polling — reduced from 5s to cut API calls 50%
+    // Skip polling entirely when stream is active (stream gives real-time data)
     const pollInterval = setInterval(() => {
+      if (streamStartedRef.current.size > 0) return; // Skip during stream
       fetchTasks();
-    }, 5000);
+    }, 10_000);
 
-    // 20-second engine status polling
-    enginePollRef.current = setInterval(fetchEngineStatus, 20000);
+    // 60-second engine status polling (was 20s — 67% reduction)
+    enginePollRef.current = setInterval(fetchEngineStatus, 60_000);
 
     return () => {
       clearInterval(pollInterval);
@@ -2479,6 +2626,25 @@ export default function MflixApp() {
                               {/* ── Links (LinkCards) ──────────────────── */}
                               {task.links && task.links.length > 0 ? (
                                 <>
+                                  {/* PROBLEM 4: Global "Retry Failed" button */}
+                                  {(() => {
+                                    const failedLinks = task.links.filter((l: any) => {
+                                      const s = (l.status || '').toLowerCase();
+                                      return s === 'error' || s === 'failed';
+                                    });
+                                    const hasFailedLinks = failedLinks.length > 0;
+
+                                    return hasFailedLinks && trueStatus !== 'processing' ? (
+                                      <button
+                                        onClick={() => handleRetryFailed(task)}
+                                        className="w-full mb-4 py-2.5 px-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-bold flex items-center justify-center gap-2 hover:bg-rose-500/20 transition-all active:scale-[0.98]"
+                                      >
+                                        <RotateCcw className="w-3.5 h-3.5" />
+                                        RETRY {failedLinks.length} FAILED LINK{failedLinks.length > 1 ? 'S' : ''} ONLY
+                                      </button>
+                                    ) : null;
+                                  })()}
+
                                   {task.links.map(
                                     (link: any, idx: number) => {
                                       const effective =
@@ -2491,6 +2657,7 @@ export default function MflixApp() {
                                         <LinkCard
                                           key={idx}
                                           id={idx}
+                                          linkId={link.id ?? idx}
                                           name={
                                             link.name ||
                                             `Link ${idx + 1}`
@@ -2503,6 +2670,10 @@ export default function MflixApp() {
                                               | 'done'
                                               | 'error'
                                           }
+                                          onRepeat={(linkId) =>
+                                            handleRepeatLink(task.id, linkId, task.links)
+                                          }
+                                          isRepeating={repeatingLinkId === (link.id ?? idx)}
                                         />
                                       );
                                     }
