@@ -256,19 +256,23 @@ export async function GET(req: NextRequest) {
           triggeredRelay = true;
           // Determine origin safely for Vercel
           const targetUrl = process.env.VERCEL_URL 
-            ? `https://${process.env.VERCEL_URL}/api/stream_solve` 
-            : `${req.nextUrl.origin}/api/stream_solve`;
+            ? `https://${process.env.VERCEL_URL}/api/solve_task` 
+            : `${req.nextUrl.origin}/api/solve_task`;
 
           try {
             fetch(targetUrl, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 
+                'Content-Type': 'application/json',
+                'x-mflix-internal': 'true',
+              },
               body: JSON.stringify({
-                links: timerLinks,
                 taskId,
+                timerLinks,
+                timerIndex:  1,
                 extractedBy: 'Server/Auto-Pilot',
-                isRelay: true, 
-                currentTimerIndex: 1 
+                relayDepth:  1,
+                mode:        'relay',
               }),
               keepalive: true // Don't await this, let it run in background to "cut the wire"
             }).catch(e => console.error('[Relay Race] Cron fetch error:', e));
