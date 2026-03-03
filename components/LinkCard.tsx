@@ -10,12 +10,12 @@ interface LogEntry {
 
 interface LinkCardProps {
   id: number;
-  linkId: number | string;        // Actual link ID from Firebase (l.id)
+  linkId: number | string;
   name: string;
   logs: LogEntry[];
   finalLink: string | null;
   status: 'processing' | 'done' | 'error';
-  onRepeat?: (linkId: number | string) => void;   // PROBLEM 5: Individual repeat
+  onRepeat?: (linkId: number | string) => void;
   isRepeating?: boolean;
 }
 
@@ -30,7 +30,7 @@ export default function LinkCard({
   isRepeating = false,
 }: LinkCardProps) {
   const [copied, setCopied] = useState(false);
-  const [showLogs, setShowLogs] = useState(true); // PROBLEM 3: Always show logs by default
+  const [showLogs, setShowLogs] = useState(true);
   const logEndRef = useRef<HTMLDivElement>(null);
 
   const handleCopy = async () => {
@@ -69,6 +69,11 @@ export default function LinkCard({
     }
   };
 
+  // Filter out "Queued for processing..." — only show real logs
+  const realLogs = logs.filter(
+    (log) => !log.msg.includes('Queued for processing')
+  );
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -84,7 +89,6 @@ export default function LinkCard({
         </div>
 
         <div className="flex items-center gap-1.5 flex-shrink-0">
-          {/* PROBLEM 5: Individual Repeat Button */}
           {(status === 'error' || status === 'done') && onRepeat && (
             <button
               onClick={(e) => {
@@ -107,22 +111,20 @@ export default function LinkCard({
             </button>
           )}
 
-          {/* Status Icon */}
           {status === 'processing' && <CircleDashed className="w-4 h-4 text-indigo-400 animate-spin" />}
           {status === 'done' && <CircleCheck className="w-4 h-4 text-emerald-400" />}
           {status === 'error' && <AlertCircle className="w-4 h-4 text-rose-400" />}
         </div>
       </div>
 
-      {/* PROBLEM 3: Live Logs Terminal — ALWAYS visible when logs exist */}
-      {logs.length > 0 ? (
+      {/* Logs — ONLY when real logs exist (no "Queued" or "Processing" filler) */}
+      {realLogs.length > 0 && (
         <>
-          {/* Toggle button for logs */}
           <button
             onClick={() => setShowLogs(!showLogs)}
             className="text-[10px] text-slate-600 hover:text-slate-400 mb-1.5 flex items-center gap-1 transition-colors"
           >
-            {showLogs ? '▼' : '▶'} Logs ({logs.length})
+            {showLogs ? '\u25BC' : '\u25B6'} Logs ({realLogs.length})
           </button>
 
           {showLogs && (
@@ -130,24 +132,17 @@ export default function LinkCard({
               ref={logEndRef}
               className="bg-black/80 p-3 rounded-lg font-mono text-[11px] max-h-[150px] overflow-y-auto mb-3 space-y-0.5"
             >
-              {logs.map((log, i) => (
+              {realLogs.map((log, i) => (
                 <div key={i} className={`leading-relaxed ${getLogColor(log.type)}`}>
                   &gt; {log.msg}
                 </div>
               ))}
-              {status === 'processing' && (
-                <div className="text-slate-500 animate-pulse">&gt; Processing...</div>
-              )}
             </div>
           )}
         </>
-      ) : status === 'processing' ? (
-        <div className="bg-black/80 p-3 rounded-lg font-mono text-[11px] mb-3">
-          <div className="text-slate-500 animate-pulse">&gt; Queued for processing...</div>
-        </div>
-      ) : null}
+      )}
 
-      {/* Final Link */}
+      {/* Final Link — OUTPUT */}
       <AnimatePresence>
         {finalLink && (
           <motion.div
@@ -161,7 +156,7 @@ export default function LinkCard({
               className="cursor-pointer bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 rounded-xl font-mono text-xs p-3 flex items-center justify-between gap-2 hover:bg-emerald-500/20 transition-colors"
             >
               <span className="truncate">
-                {copied ? 'COPIED TO CLIPBOARD! ✅' : finalLink}
+                {copied ? 'COPIED TO CLIPBOARD! \u2705' : finalLink}
               </span>
               {copied ? (
                 <Check className="w-3.5 h-3.5 flex-shrink-0" />
