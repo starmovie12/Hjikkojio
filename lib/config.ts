@@ -17,19 +17,18 @@ export const TARGET_DOMAINS = [
 ] as const;
 
 // ─── Timeout Configuration ────────────────────────────────────────────────────
-// STRICT 45s — 15s buffer before Vercel 60s hard-kill.
-// VPS Timer APIs take 25-35s, HubCloud VPS takes 15-30s — both fit in 45s.
-export const AXIOS_TIMEOUT_MS   = 45_000;  // Per-HTTP-request timeout
-export const LINK_TIMEOUT_MS    = 45_000;  // Per-link overall timeout (full chain)
-export const OVERALL_TIMEOUT_MS = 55_000;  // Overall invocation safety limit
+// Vercel hard limit = 60s. Relay Race = 1 link per 60s window.
+// Timer VPS: 20-35s | HubCloud VPS: 15-30s | Both fit in 50s budget.
+export const AXIOS_TIMEOUT_MS   = 50_000;
+export const LINK_TIMEOUT_MS    = 50_000;
+export const OVERALL_TIMEOUT_MS = 55_000;
 
-// ─── Relay Race Configuration (Phase 5) ──────────────────────────────────────
-// Each API call processes ONE timer link → saves FINAL link → triggers relay for next.
-// Each relay gets a fresh 60s Vercel timer.
-export const RELAY_SAFETY_MARGIN_MS = 10_000; // Trigger relay 10s before timeout
-export const RELAY_MAX_CHAIN_DEPTH  = 10;     // Max relay hops to prevent infinite chains
+// ─── Relay Race Configuration (Phase 6) ─────────────────────────────────────
+// Self-triggering webhook chain. Fresh 60s per link.
+export const RELAY_SAFETY_MARGIN_MS = 8_000;
+export const RELAY_MAX_CHAIN_DEPTH  = 20;
 
-// ─── Retry Configuration (Phase 4) ───────────────────────────────────────────
+// ─── Retry Configuration ────────────────────────────────────────────────────
 export const MAX_RETRY_ATTEMPTS      = 2;
 export const SMART_RETRY_MAX         = 3;
 export const SMART_RETRY_BACKOFF_MS  = 2000;
@@ -38,9 +37,9 @@ export const HTTP_522_MAX_RETRIES    = 2;
 // ─── Stuck Task & Cron ────────────────────────────────────────────────────────
 export const STUCK_TASK_THRESHOLD_MS = 10 * 60 * 1_000;
 export const MAX_CRON_RETRIES        = 3;
-export const TASK_POLL_INTERVAL_MS   = 5_000;
+export const TASK_POLL_INTERVAL_MS   = 10_000;
 
-// ─── Link Cache (Phase 4) ────────────────────────────────────────────────────
+// ─── Link Cache ─────────────────────────────────────────────────────────────
 export const CACHE_EXPIRY_MS   = 24 * 60 * 60 * 1_000;
 export const CACHE_COLLECTION  = 'link_cache';
 
