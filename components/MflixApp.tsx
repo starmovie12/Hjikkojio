@@ -919,8 +919,10 @@ export default function MflixApp() {
    * Ek queue item ko 3 steps mein process karta hai:
    * 1. POST /api/tasks → taskId milta hai
    * 2. GET /api/tasks → pending links filter karo
-   * 3. POST /api/solve_task → server-side solve (non-streaming)
-   *    Browser close kar sakte hain solve_task ke dauran.
+   * 3. POST /api/stream_solve → NDJSON stream (LIVE logs + output)
+   *    Stream tab tak open rehta hai jab tak SAARE links done nahi ho jaate.
+   *    Isliye auto-pilot NEXT movie TABHI start karega jab current movie
+   *    ka stream close ho jayega → 1 MOVIE AT A TIME guaranteed.
    */
   const processQueueItemAutoPilot = useCallback(
     async (item: QueueItem): Promise<boolean> => {
@@ -970,24 +972,124 @@ export default function MflixApp() {
           'info'
         );
 
-        // ── Step 3: Server-side solve ──────────────────────────────────────
-        // x-mflix-internal header se internal request mark karo
-        const solveRes = await fetch('/api/solve_task', {
+        // ── Step 3: LIVE NDJSON Stream Solve ──────────────────────────────
+        // stream_solve use karo — NDJSON stream return karta hai
+        // Jab tak stream open hai, sab links process ho rahe hain
+        // Stream close = sab links done = auto-pilot WAITS = 1 movie at a time
+        //
+        // PROBLEM 1 FIX: Ye stream tab tak close nahi hota jab tak SAARE links
+        // process nahi ho jaate. Isliye auto-pilot NEXT movie tab tak start nahi
+        // karega jab tak current movie complete nahi ho jaati.
+        //
+        // PROBLEM 2 FIX: NDJSON stream se har link ka live log, status, aur
+        // final output real-time mein UI pe dikhta hai.
+
+        // Set active task for UI — logs real-time dikhenge
+        setActiveTaskId(taskId);
+        setExpandedTask(taskId);
+
+        // Initialize per-link live states
+        const initLogs: Record<number, LogEntry[]> = {};
+        const initLinks: Record<number, string | null> = {};
+        const initStatuses: Record<number, string> = {};
+        (task.links || []).forEach((link: any, idx: number) => {
+          initStatuses[idx] = 'processing';
+          initLogs[idx] = link.logs || [];
+          initLinks[idx] = link.finalLink || null;
+        });
+        setLiveLogs(initLogs);
+        setLiveLinks(initLinks);
+        setLiveStatuses(initStatuses);
+
+        // Shield initialize karo
+        if (!completedLinksRef.current[taskId]) {
+          completedLinksRef.current[taskId] = {};
+        }
+
+        // Local mutable objects for closure access (stale closure se bachne ke liye)
+        const currentLogs: Record<number, LogEntry[]> = { ...initLogs };
+        const currentLinks: Record<number, string | null> = { ...initLinks };
+        const currentStatus: Record<number, string> = { ...initStatuses };
+
+        addAutoPilotLog(`🚀 Starting LIVE stream for ${pendingLinks.length} links...`, 'info');
+
+        const streamRes = await fetch('/api/stream_solve', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-mflix-internal': 'true',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            taskId,
             links: pendingLinks,
+            taskId,
             extractedBy: 'Server/Auto-Pilot',
           }),
         });
 
-        if (!solveRes.ok) {
-          throw new Error(`solve_task failed: ${solveRes.status}`);
+        if (!streamRes.ok || !streamRes.body) {
+          throw new Error(`stream_solve failed: ${streamRes.status}`);
         }
+
+        // ── Read NDJSON stream — BLOCKS until ALL links are done ──────────
+        const reader = streamRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const streamLines = buffer.split('\n');
+          buffer = streamLines.pop() || '';
+
+          for (const line of streamLines) {
+            if (!line.trim()) continue;
+            try {
+              const data = JSON.parse(line);
+              const lid: number = data.id;
+
+              // ── Live log message → UI update ────────────────────────
+              if (data.msg && data.type) {
+                const newLog: LogEntry = { msg: data.msg, type: data.type as LogEntry['type'] };
+                currentLogs[lid] = [...(currentLogs[lid] || []), newLog];
+                setLiveLogs(prev => ({ ...prev, [lid]: currentLogs[lid] }));
+              }
+
+              // ── Final link resolved ─────────────────────────────────
+              if (data.final) {
+                currentLinks[lid] = data.final;
+                setLiveLinks(prev => ({ ...prev, [lid]: data.final }));
+              }
+
+              // ── Status: done / error → Shield save ──────────────────
+              if (data.status === 'done' || data.status === 'error') {
+                currentStatus[lid] = data.status;
+                setLiveStatuses(prev => ({ ...prev, [lid]: data.status }));
+                completedLinksRef.current[taskId][lid] = {
+                  status: data.status,
+                  finalLink: data.final || currentLinks[lid],
+                  best_button_name: data.best_button_name,
+                  logs: [...(currentLogs[lid] || [])],
+                };
+              }
+
+              // ── Finished marker ─────────────────────────────────────
+              if (data.status === 'finished') {
+                if (currentStatus[lid] !== 'done' && currentStatus[lid] !== 'error') {
+                  completedLinksRef.current[taskId][lid] = {
+                    status: 'error',
+                    logs: [...(currentLogs[lid] || [])],
+                  };
+                  setLiveStatuses(prev => ({ ...prev, [lid]: 'error' }));
+                }
+              }
+            } catch { /* skip bad JSON line */ }
+          }
+        }
+
+        // ── Stream ended — all links processed within this request ────────
+        setActiveTaskId(null);
+        fetchTasks();
+        await sleep(2000);
+        fetchTasks();
 
         addAutoPilotLog(`🎉 Done: ${item.title || item.url}`, 'success');
         await patchQueueStatus(item, 'completed');
@@ -997,10 +1099,11 @@ export default function MflixApp() {
         const errorMsg = e?.message || 'Unknown error';
         addAutoPilotLog(`❌ Failed: ${errorMsg}`, 'error');
         await patchQueueStatus(item, 'failed', errorMsg);
+        setActiveTaskId(null);
         return false;
       }
     },
-    [addAutoPilotLog, patchQueueStatus]
+    [addAutoPilotLog, patchQueueStatus, fetchTasks]
   );
 
   /**
