@@ -234,6 +234,18 @@ export default function MflixApp() {
   // ─── AI Control Center State ────────────────────────────────────────────
   const [showAiPanel, setShowAiPanel] = useState(false);
 
+  // ─── VPS Settings Panel ─────────────────────────────────────────────────
+  const [showVpsSettings, setShowVpsSettings] = useState(false);
+  const [vpsForm, setVpsForm] = useState({
+    vpsBaseUrl:   'http://85.121.5.246',
+    hubcloudPort: '5001',
+    timerPort:    '10000',
+  });
+  const [vpsSaving, setVpsSaving]           = useState(false);
+  const [vpsSaveMsg, setVpsSaveMsg]         = useState<string | null>(null);
+  const [vpsConfigLoaded, setVpsConfigLoaded] = useState(false);
+
+
   // ─── Phase 4: Stuck Task Detection + Force Reset ───────────────────────
   const [stuckCount, setStuckCount] = useState<number>(0);
   const [isResettingStuck, setIsResettingStuck] = useState(false);
@@ -507,6 +519,47 @@ export default function MflixApp() {
     }
   }, []);
 
+  // ─── VPS Settings: Load + Save ──────────────────────────────────────────
+  const loadVpsConfig = useCallback(async () => {
+    try {
+      const res  = await fetch('/api/admin/vps-config');
+      const data = await res.json();
+      if (res.ok) {
+        setVpsForm({
+          vpsBaseUrl:   data.vpsBaseUrl   || 'http://85.121.5.246',
+          hubcloudPort: data.hubcloudPort || '5001',
+          timerPort:    data.timerPort    || '10000',
+        });
+        setVpsConfigLoaded(true);
+      }
+    } catch (err) {
+      console.warn('[VPS Settings] Failed to load config', err);
+    }
+  }, []);
+
+  const saveVpsConfig = useCallback(async () => {
+    setVpsSaving(true);
+    setVpsSaveMsg(null);
+    try {
+      const res  = await fetch('/api/admin/vps-config', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(vpsForm),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setVpsSaveMsg(`✅ Saved! HubCloud: ${data.hubcloudApi} | Timer: ${data.timerApi}`);
+        setTimeout(() => setVpsSaveMsg(null), 4000);
+      } else {
+        setVpsSaveMsg(`❌ Error: ${data.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setVpsSaveMsg(`❌ Network error: ${err.message}`);
+    } finally {
+      setVpsSaving(false);
+    }
+  }, [vpsForm]);
+
   // ─── Phase 4: Force Reset All Stuck Tasks ──────────────────────────────
   const handleForceReset = useCallback(async (forceAll = false) => {
     setIsResettingStuck(true);
@@ -536,6 +589,12 @@ export default function MflixApp() {
       setIsResettingStuck(false);
     }
   }, [fetchTasks, fetchEngineStatus]);
+
+  // On mount: load VPS config from Firebase
+  useEffect(() => {
+    loadVpsConfig();
+  }, [loadVpsConfig]);
+
 
   // ─────────────────────────────────────────────────────────────────────────
   // COMPUTED HELPERS — 3-Layer Data Resolution
@@ -1732,6 +1791,157 @@ export default function MflixApp() {
       {/* ── BACKGROUND GRADIENT ──────────────────────────────────────────── */}
       <div className="fixed inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-indigo-950/20 via-black to-black pointer-events-none z-0" />
 
+      {/* ════════════════════════════════════════════════════════════════════ */}
+      {/* VPS SETTINGS MODAL                                                  */}
+      {/* ════════════════════════════════════════════════════════════════════ */}
+      <AnimatePresence>
+        {showVpsSettings && (
+          <motion.div
+            key="vps-settings-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+            onClick={() => setShowVpsSettings(false)}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.92, y: 16 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.92, y: 16 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 28 }}
+              className="w-full max-w-md bg-slate-900 border border-slate-700/60 rounded-2xl shadow-2xl overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700/40 bg-slate-800/60">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-indigo-600/30 border border-indigo-500/30 flex items-center justify-center">
+                    <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-white">VPS API Settings</p>
+                    <p className="text-[10px] text-slate-400 font-mono">Firebase me save hoga · Auto-apply</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowVpsSettings(false)}
+                  className="w-7 h-7 rounded-lg bg-slate-700/50 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-600/50 transition-all"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="px-5 py-5 space-y-4">
+
+                {/* VPS Base URL */}
+                <div>
+                  <label className="block text-[11px] font-mono font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
+                    VPS Base URL
+                  </label>
+                  <input
+                    type="text"
+                    value={vpsForm.vpsBaseUrl}
+                    onChange={(e) => setVpsForm(f => ({ ...f, vpsBaseUrl: e.target.value }))}
+                    placeholder="http://85.121.5.246"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-600/50 text-white font-mono text-sm placeholder-slate-600 focus:outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/30 transition-all"
+                  />
+                  <p className="mt-1 text-[10px] text-slate-500 font-mono">e.g. http://85.121.5.246 (no trailing slash)</p>
+                </div>
+
+                {/* Ports Row */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-mono font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
+                      HubCloud Port
+                    </label>
+                    <input
+                      type="text"
+                      value={vpsForm.hubcloudPort}
+                      onChange={(e) => setVpsForm(f => ({ ...f, hubcloudPort: e.target.value }))}
+                      placeholder="5001"
+                      className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-600/50 text-white font-mono text-sm placeholder-slate-600 focus:outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/30 transition-all"
+                    />
+                    <p className="mt-1 text-[10px] text-slate-500 font-mono">HubCloud solver</p>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-mono font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
+                      Timer Port
+                    </label>
+                    <input
+                      type="text"
+                      value={vpsForm.timerPort}
+                      onChange={(e) => setVpsForm(f => ({ ...f, timerPort: e.target.value }))}
+                      placeholder="10000"
+                      className="w-full px-3 py-2.5 rounded-xl bg-slate-800 border border-slate-600/50 text-white font-mono text-sm placeholder-slate-600 focus:outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/30 transition-all"
+                    />
+                    <p className="mt-1 text-[10px] text-slate-500 font-mono">GadgetsWeb / Timer</p>
+                  </div>
+                </div>
+
+                {/* Preview */}
+                <div className="rounded-xl bg-slate-800/50 border border-slate-700/40 px-4 py-3 space-y-1">
+                  <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest mb-2">Preview</p>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-indigo-400 w-20">HubCloud:</span>
+                    <span className="text-[11px] font-mono text-slate-300 truncate">
+                      {vpsForm.vpsBaseUrl || '…'}:{vpsForm.hubcloudPort || '…'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-emerald-400 w-20">Timer:</span>
+                    <span className="text-[11px] font-mono text-slate-300 truncate">
+                      {vpsForm.vpsBaseUrl || '…'}:{vpsForm.timerPort || '…'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Save Result Toast */}
+                {vpsSaveMsg && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className={`px-3 py-2 rounded-xl text-[11px] font-mono ${
+                      vpsSaveMsg.startsWith('✅')
+                        ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+                        : 'bg-rose-500/10 border border-rose-500/20 text-rose-400'
+                    }`}
+                  >
+                    {vpsSaveMsg}
+                  </motion.div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="px-5 pb-5 flex gap-3">
+                <button
+                  onClick={() => setShowVpsSettings(false)}
+                  className="flex-1 py-2.5 rounded-xl bg-slate-700/50 border border-slate-600/40 text-slate-300 text-sm font-medium hover:bg-slate-700 transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={saveVpsConfig}
+                  disabled={vpsSaving}
+                  className="flex-1 py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-bold hover:bg-indigo-500 active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {vpsSaving ? '⏳ Saving...' : '💾 Save to Firebase'}
+                </button>
+              </div>
+
+              {/* Info footer */}
+              <div className="px-5 pb-4">
+                <p className="text-[10px] text-slate-600 font-mono text-center">
+                  Config Firebase me store hoga · Next API call pe auto-load hoga (60s cache)
+                </p>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ── MAIN CONTENT AREA ────────────────────────────────────────────── */}
       <div className="relative z-10 max-w-2xl mx-auto px-4 pt-5 pb-28">
 
@@ -1754,6 +1964,18 @@ export default function MflixApp() {
 
           {/* Right: AI Button + Engine status indicator */}
           <div className="flex items-center gap-3">
+            {/* VPS Settings Button */}
+            <button
+              onClick={() => { setShowVpsSettings(true); if (!vpsConfigLoaded) loadVpsConfig(); }}
+              className="relative w-8 h-8 rounded-lg bg-slate-700/60 border border-slate-600/40 flex items-center justify-center hover:bg-slate-600/60 active:scale-95 transition-all group"
+              title="VPS API Settings"
+            >
+              <svg className="w-4 h-4 text-slate-400 group-hover:text-slate-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+
             {/* AI Control Center Button */}
             <button
               onClick={() => setShowAiPanel(true)}
