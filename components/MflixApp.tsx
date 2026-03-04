@@ -522,7 +522,7 @@ export default function MflixApp() {
   // ─── VPS Settings: Load + Save ──────────────────────────────────────────
   const loadVpsConfig = useCallback(async () => {
     try {
-      const res  = await fetch('/api/admin/vps-config');
+      const res  = await fetch('/api/vps-config');
       const data = await res.json();
       if (res.ok) {
         setVpsForm({
@@ -541,7 +541,7 @@ export default function MflixApp() {
     setVpsSaving(true);
     setVpsSaveMsg(null);
     try {
-      const res  = await fetch('/api/admin/vps-config', {
+      const res  = await fetch('/api/vps-config', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(vpsForm),
