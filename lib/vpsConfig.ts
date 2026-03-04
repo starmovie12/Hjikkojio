@@ -2,11 +2,12 @@
  * lib/vpsConfig.ts
  *
  * Dynamic VPS configuration loader.
- * Reads from Firebase Firestore (system/vps_config) with a 60-second in-memory cache.
+ * Reads directly from Firebase Firestore (system/vps_config).
+ * Cache removed to ensure INSTANT updates across all serverless functions.
  * Falls back to env vars / hardcoded defaults if Firebase read fails.
  *
  * Usage in solvers:
- *   const { hubcloudApi, timerApi } = await getVpsConfig();
+ * const { hubcloudApi, timerApi } = await getVpsConfig();
  */
 
 import { db } from './firebaseAdmin';
@@ -25,10 +26,6 @@ const DEFAULTS: VpsConfig = {
   timerPort:    process.env.TIMER_PORT     || '10000',
 };
 
-// ─── 60-second in-memory cache ───────────────────────────────────────────────
-let _cache: { config: VpsConfig; at: number } | null = null;
-const CACHE_TTL_MS = 60_000; // 1 minute
-
 export interface ResolvedVpsConfig {
   config:       VpsConfig;
   hubcloudApi:  string;   // full URL, e.g. "http://85.121.5.246:5001"
@@ -36,25 +33,21 @@ export interface ResolvedVpsConfig {
 }
 
 function resolve(cfg: VpsConfig): ResolvedVpsConfig {
+  // Sabse zaroori fix: URL ke aakhiri ka '/' hatao taaki http://.../:5001 na bane
+  const cleanBaseUrl = cfg.vpsBaseUrl.replace(/\/+$/, '');
+  
   return {
     config:      cfg,
-    hubcloudApi: `${cfg.vpsBaseUrl}:${cfg.hubcloudPort}`,
-    timerApi:    `${cfg.vpsBaseUrl}:${cfg.timerPort}`,
+    hubcloudApi: `${cleanBaseUrl}:${cfg.hubcloudPort}`,
+    timerApi:    `${cleanBaseUrl}:${cfg.timerPort}`,
   };
 }
 
 /**
- * Returns VPS API URLs from Firebase (cached for 60s).
+ * Returns VPS API URLs from Firebase (ALWAYS FRESH).
  * Never throws — always returns a usable config.
  */
 export async function getVpsConfig(): Promise<ResolvedVpsConfig> {
-  const now = Date.now();
-
-  // Return cache if still fresh
-  if (_cache && now - _cache.at < CACHE_TTL_MS) {
-    return resolve(_cache.config);
-  }
-
   try {
     const doc  = await db.collection('system').doc('vps_config').get();
     const data = doc.exists ? (doc.data() as Partial<VpsConfig>) : {};
@@ -65,7 +58,7 @@ export async function getVpsConfig(): Promise<ResolvedVpsConfig> {
       timerPort:    (data.timerPort    || DEFAULTS.timerPort).trim(),
     };
 
-    _cache = { config, at: now };
+    console.log('[VPS Config] Loaded FRESH URL from Firebase:', config.vpsBaseUrl);
     return resolve(config);
   } catch (err) {
     console.warn('[vpsConfig] Firebase read failed, using defaults:', err);
@@ -74,10 +67,11 @@ export async function getVpsConfig(): Promise<ResolvedVpsConfig> {
 }
 
 /**
- * Call this after saving new config to Firebase so next call re-fetches.
+ * Empty function kept so old API route doesn't crash.
+ * Cache is no longer used, so nothing needs to be invalidated.
  */
 export function invalidateVpsConfigCache(): void {
-  _cache = null;
+  // Intentionally empty
 }
 
 /** Expose defaults for the settings UI initial state */
